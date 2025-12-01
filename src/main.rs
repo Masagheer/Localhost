@@ -9,11 +9,11 @@ struct Server {
 
 impl Server {
     pub fn new(port: u16) -> io::Result<Server> {
-        let address = format!("127.0.0.1:{}", port);
-        let listener = TcpListener::bind(&address)?;
+        // let address = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
         listener.set_nonblocking(true)?;
         
-        println!("Server started on port {}", port);
+        println!("Server started on port http://localhost:{}/", port);
         
         Ok(Server {
             listener,
