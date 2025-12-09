@@ -3,9 +3,52 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::collections::HashMap;
 use libc::{epoll_create1, epoll_ctl, epoll_wait, epoll_event, EPOLLIN, EPOLLERR, EPOLLHUP, EPOLL_CTL_ADD, EPOLL_CTL_DEL};
+// Import Serde
+use serde_derive::Deserialize;
+use std::fs;
 
-const MAX_EVENTS: usize = 1024;
-const TIMEOUT_MS: i32 = 1000; // 1 second timeout
+#[derive(Deserialize)]
+struct Config {
+    server: ServerConfig,
+    #[allow(dead_code)]
+    logging: LoggingConfig,
+}
+
+#[derive(Deserialize)]
+struct ServerConfig {
+    host: String,
+    port: u16,
+    timeout_ms: i32,
+    max_events: usize,
+}
+
+#[derive(Deserialize)]
+struct LoggingConfig {
+    #[allow(dead_code)]
+    level: String,
+    #[allow(dead_code)]
+    file: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum ServerError {
+    Io(io::Error),
+    Config(toml::de::Error),
+    InvalidConfig(String),
+}
+
+impl From<io::Error> for ServerError {
+    fn from(err: io::Error) -> ServerError {
+        ServerError::Io(err)
+    }
+}
+
+impl From<toml::de::Error> for ServerError {
+    fn from(err: toml::de::Error) -> ServerError {
+        ServerError::Config(err)
+    }
+}
 
 struct Connection {
     stream: TcpStream,
@@ -13,14 +56,23 @@ struct Connection {
 
 struct Server {
     listener: TcpListener,
-    port: u16,
+    config: Config,
     epoll_fd: RawFd,
     connections: HashMap<RawFd, Connection>,
 }
 
 impl Server {
-    pub fn new(port: u16) -> io::Result<Server> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
+    pub fn new(config_path: &str) -> io::Result<Server> {
+        // Read and parse configuration
+        let config_content = fs::read_to_string(config_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to read config: {}", e)))?;
+        
+        let config: Config = toml::from_str(&config_content)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to parse config: {}", e)))?;
+
+        let address = format!("{}:{}", config.server.host, config.server.port);
+
+        let listener = TcpListener::bind(&address)?;
         listener.set_nonblocking(true)?;
         
         // Create epoll instance
@@ -46,26 +98,26 @@ impl Server {
             }
         }
         
-        println!("Server started on http://localhost:{}/", port);
+        println!("Server started on http://{}:{}/", config.server.host, config.server.port);
         
         Ok(Server {
             listener,
-            port,
+            config,
             epoll_fd,
             connections: HashMap::new(),
         })
     }
     
     pub fn run(&mut self) -> io::Result<()> {
-        let mut events = vec![epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
+        let mut events = vec![epoll_event { events: 0, u64: 0 }; self.config.server.max_events];
         
         loop {
             let num_events = unsafe {
                 epoll_wait(
                     self.epoll_fd,
                     events.as_mut_ptr(),
-                    MAX_EVENTS as i32,
-                    TIMEOUT_MS,
+                    self.config.server.max_events as i32,
+                    self.config.server.timeout_ms,
                 )
             };
 
@@ -163,7 +215,7 @@ impl Server {
 
         if should_send_response {
             if let Some(conn) = self.connections.get_mut(&fd) {
-                Self::send_response(&mut conn.stream, self.port)?;
+                Self::send_response(&mut conn.stream, self.config.server.port)?;
             }
         }
         Ok(())
@@ -183,9 +235,37 @@ impl Server {
         stream.flush()?;
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub fn reload_config(&mut self, config_path: &str) -> io::Result<()> {
+        let config_content = fs::read_to_string(config_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to read config: {}", e)))?;
+        
+        self.config = toml::from_str(&config_content)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to parse config: {}", e)))?;
+        
+        println!("Configuration reloaded successfully");
+        Ok(())
+    }
+}
+
+impl Config {
+    #[allow(dead_code)]
+    fn validate(&self) -> Result<(), ServerError> {
+        if self.server.port == 0 {
+            return Err(ServerError::InvalidConfig("Port cannot be 0".into()));
+        }
+        if self.server.max_events == 0 {
+            return Err(ServerError::InvalidConfig("max_events cannot be 0".into()));
+        }
+        if self.server.timeout_ms < 0 {
+            return Err(ServerError::InvalidConfig("timeout_ms cannot be negative".into()));
+        }
+        Ok(())
+    }
 }
 
 fn main() -> io::Result<()> {
-    let mut server = Server::new(8080)?;
+    let mut server = Server::new("config.toml")?;
     server.run()
 }
