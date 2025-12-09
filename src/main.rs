@@ -11,8 +11,14 @@ use std::fs;
 struct HttpRequest {
     method: String,
     path: String,
+    #[allow(dead_code)]
+    query_string: Option<String>,
     version: String,
     headers: HashMap<String, String>,
+    #[allow(dead_code)]
+    cookies: HashMap<String, String>,
+    #[allow(dead_code)]
+    query_params: HashMap<String, String>,
     #[allow(dead_code)]
     body: Vec<u8>,
 }
@@ -63,18 +69,29 @@ impl HttpParser {
             return None;
         }
         
-        // Parse request line: "GET /path HTTP/1.1"
+        // Parse request line: "GET /path?query=value HTTP/1.1"
         let request_line_parts: Vec<&str> = lines[0].split_whitespace().collect();
         if request_line_parts.len() < 3 {
             return None;
         }
         
         let method = request_line_parts[0].to_string();
-        let path = request_line_parts[1].to_string();
+        let full_path = request_line_parts[1];
         let version = request_line_parts[2].to_string();
+        
+        // Split path and query string
+        let (path, query_string) = if let Some(pos) = full_path.find('?') {
+            (
+                full_path[..pos].to_string(),
+                Some(full_path[pos + 1..].to_string()),
+            )
+        } else {
+            (full_path.to_string(), None)
+        };
         
         // Parse headers
         let mut headers = HashMap::new();
+        let mut cookies = HashMap::new();
         let mut body_start = 0;
         
         for (i, line) in lines.iter().enumerate().skip(1) {
@@ -86,9 +103,22 @@ impl HttpParser {
             if let Some(colon_pos) = line.find(':') {
                 let key = line[..colon_pos].trim().to_string();
                 let value = line[colon_pos + 1..].trim().to_string();
+                
+                // Special handling for Cookie header
+                if key.to_lowercase() == "cookie" {
+                    Self::parse_cookies(&value, &mut cookies);
+                }
+                
                 headers.insert(key, value);
             }
         }
+        
+        // Parse query parameters
+        let query_params = if let Some(ref qs) = query_string {
+            Self::parse_query_string(qs)
+        } else {
+            HashMap::new()
+        };
         
         // Parse body
         let body = if body_start < lines.len() {
@@ -100,10 +130,61 @@ impl HttpParser {
         Some(HttpRequest {
             method,
             path,
+            query_string,
             version,
             headers,
+            cookies,
+            query_params,
             body,
         })
+    }
+    
+    fn parse_cookies(cookie_header: &str, cookies: &mut HashMap<String, String>) {
+        for cookie in cookie_header.split(';') {
+            let cookie = cookie.trim();
+            if let Some(pos) = cookie.find('=') {
+                let name = cookie[..pos].trim().to_string();
+                let value = cookie[pos + 1..].trim().to_string();
+                cookies.insert(name, value);
+            }
+        }
+    }
+    
+    fn parse_query_string(query_string: &str) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        for param in query_string.split('&') {
+            if let Some(pos) = param.find('=') {
+                let key = Self::url_decode(&param[..pos]);
+                let value = Self::url_decode(&param[pos + 1..]);
+                params.insert(key, value);
+            } else {
+                params.insert(Self::url_decode(param), String::new());
+            }
+        }
+        params
+    }
+    
+    fn url_decode(encoded: &str) -> String {
+        let mut result = String::new();
+        let mut bytes = encoded.bytes().peekable();
+        
+        while let Some(byte) = bytes.next() {
+            match byte {
+                b'%' => {
+                    if let (Some(h1), Some(h2)) = (bytes.next(), bytes.next()) {
+                        if let Ok(hex_str) = std::str::from_utf8(&[h1, h2]) {
+                            if let Ok(byte_val) = u8::from_str_radix(hex_str, 16) {
+                                result.push(byte_val as char);
+                            }
+                        }
+                    }
+                }
+                b'+' => result.push(' '),
+                b => result.push(b as char),
+            }
+        }
+        
+        result
     }
 }
 
@@ -464,6 +545,105 @@ fn handle_api_catch_all(req: &HttpRequest) -> HttpResponse {
     HttpResponse::new(200, "OK", &body)
 }
 
+fn handle_inspect(req: &HttpRequest) -> HttpResponse {
+    let mut body = String::from(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Request Inspector</title>
+    <style>
+        body { font-family: monospace; margin: 20px; }
+        .section { margin: 20px 0; padding: 10px; background: #f5f5f5; border-left: 4px solid #667eea; }
+        h2 { color: #667eea; margin-top: 0; }
+        table { width: 100%; border-collapse: collapse; }
+        td { padding: 8px; border-bottom: 1px solid #ddd; }
+        td:first-child { font-weight: bold; color: #333; width: 20%; }
+        a { color: #667eea; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>Request Inspector</h1>
+"#);
+    
+    // Request line info
+    body.push_str(&format!(
+        r#"<div class="section">
+        <h2>Request Line</h2>
+        <table>
+            <tr><td>Method:</td><td>{}</td></tr>
+            <tr><td>Path:</td><td>{}</td></tr>
+            <tr><td>Query String:</td><td>{}</td></tr>
+            <tr><td>HTTP Version:</td><td>{}</td></tr>
+        </table>
+    </div>"#,
+        req.method,
+        req.path,
+        req.query_string.as_ref().unwrap_or(&"(none)".to_string()),
+        req.version
+    ));
+    
+    // Headers
+    if !req.headers.is_empty() {
+        body.push_str(r#"<div class="section">
+        <h2>Headers</h2>
+        <table>"#);
+        for (key, value) in &req.headers {
+            body.push_str(&format!("<tr><td>{}:</td><td>{}</td></tr>", key, value));
+        }
+        body.push_str("</table></div>");
+    }
+    
+    // Cookies
+    if !req.cookies.is_empty() {
+        body.push_str(r#"<div class="section">
+        <h2>Cookies</h2>
+        <table>"#);
+        for (name, value) in &req.cookies {
+            body.push_str(&format!("<tr><td>{}:</td><td>{}</td></tr>", name, value));
+        }
+        body.push_str("</table></div>");
+    } else {
+        body.push_str(r#"<div class="section">
+        <h2>Cookies</h2>
+        <p>(no cookies)</p>
+    </div>"#);
+    }
+    
+    // Query Parameters
+    if !req.query_params.is_empty() {
+        body.push_str(r#"<div class="section">
+        <h2>Query Parameters</h2>
+        <table>"#);
+        for (key, value) in &req.query_params {
+            body.push_str(&format!("<tr><td>{}:</td><td>{}</td></tr>", key, value));
+        }
+        body.push_str("</table></div>");
+    } else {
+        body.push_str(r#"<div class="section">
+        <h2>Query Parameters</h2>
+        <p>(no query parameters)</p>
+    </div>"#);
+    }
+    
+    body.push_str(r#"<div class="section">
+        <h2>Test Links</h2>
+        <p><a href="/inspect?name=John&age=30&city=NYC">With Query Params</a></p>
+    </div>
+    
+    <div class="section">
+        <h2>cURL Examples</h2>
+        <p>Test with cookies:<br>
+        <code>curl -b "session_id=abc123; user_id=42" http://localhost:8080/inspect</code></p>
+        <p>Test with query params:<br>
+        <code>curl "http://localhost:8080/inspect?key=value&name=test"</code></p>
+    </div>
+    
+    </body>
+</html>"#);
+    
+    HttpResponse::new(200, "OK", &body)
+}
+
 #[derive(Deserialize)]
 struct Config {
     server: ServerConfig,
@@ -564,6 +744,7 @@ impl Server {
         let mut router = Router::new();
         router.register("GET", "/", handle_root);
         router.register("GET", "/health", handle_health);
+        router.register("GET", "/inspect", handle_inspect);
         router.register("GET", "/api/users", handle_users);
         router.register("POST", "/api/users", handle_users);
         router.register("GET", "/api/", handle_api_catch_all);
