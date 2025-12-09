@@ -7,6 +7,15 @@ use libc::{epoll_create1, epoll_ctl, epoll_wait, epoll_event, EPOLLIN, EPOLLERR,
 use serde_derive::Deserialize;
 use std::fs;
 
+// Form data structures
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct FormFile {
+    filename: String,
+    content_type: String,
+    data: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 struct HttpRequest {
     method: String,
@@ -20,6 +29,10 @@ struct HttpRequest {
     #[allow(dead_code)]
     query_params: HashMap<String, String>,
     #[allow(dead_code)]
+    form_fields: HashMap<String, String>,
+    #[allow(dead_code)]
+    form_files: HashMap<String, FormFile>,
+    #[allow(dead_code)]
     body: Vec<u8>,
 }
 
@@ -29,6 +42,7 @@ struct HttpResponse {
     status_text: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    is_chunked: bool,
 }
 
 impl HttpResponse {
@@ -42,6 +56,7 @@ impl HttpResponse {
             status_text: status_text.to_string(),
             headers,
             body: body.as_bytes().to_vec(),
+            is_chunked: false,
         }
     }
     
@@ -53,8 +68,182 @@ impl HttpResponse {
         response.push_str("\r\n");
         
         let mut bytes = response.into_bytes();
-        bytes.extend_from_slice(&self.body);
+        
+        if self.is_chunked {
+            // Encode body in chunks
+            let chunk_size = 1024;
+            for chunk in self.body.chunks(chunk_size) {
+                let chunk_header = format!("{:x}\r\n", chunk.len());
+                bytes.extend_from_slice(chunk_header.as_bytes());
+                bytes.extend_from_slice(chunk);
+                bytes.extend_from_slice(b"\r\n");
+            }
+            // Final chunk
+            bytes.extend_from_slice(b"0\r\n\r\n");
+        } else {
+            bytes.extend_from_slice(&self.body);
+        }
+        
         bytes
+    }
+}
+
+/// Response Builder - Fluent API for constructing HTTP responses
+struct ResponseBuilder {
+    status: u16,
+    status_text: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+    cookies: Vec<(String, String)>, // (name, value) pairs
+    is_chunked: bool,
+}
+
+impl ResponseBuilder {
+    /// Create a new response builder
+    fn new() -> Self {
+        ResponseBuilder {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+            cookies: Vec::new(),
+            is_chunked: false,
+        }
+    }
+    
+    /// Set the HTTP status code
+    fn status(mut self, status: u16, status_text: &str) -> Self {
+        self.status = status;
+        self.status_text = status_text.to_string();
+        self
+    }
+    
+    /// Add a response header
+    fn header(mut self, key: &str, value: &str) -> Self {
+        self.headers.insert(key.to_string(), value.to_string());
+        self
+    }
+    
+    /// Set Content-Type header
+    fn content_type(mut self, content_type: &str) -> Self {
+        self.headers.insert("Content-Type".to_string(), content_type.to_string());
+        self
+    }
+    
+    /// Set the response body as string
+    fn body_text(mut self, body: &str) -> Self {
+        self.body = body.as_bytes().to_vec();
+        self
+    }
+    
+    /// Set the response body as bytes
+    #[allow(dead_code)]
+    fn body_bytes(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+        self
+    }
+    
+    /// Add a Set-Cookie header
+    #[allow(dead_code)]
+    fn cookie(mut self, name: &str, value: &str) -> Self {
+        self.cookies.push((name.to_string(), value.to_string()));
+        self
+    }
+    
+    /// Add a Set-Cookie with additional options
+    fn cookie_with_options(mut self, name: &str, value: &str, max_age: Option<u32>, path: &str, http_only: bool) -> Self {
+        let mut cookie_str = format!("{}={}", name, value);
+        if let Some(age) = max_age {
+            cookie_str.push_str(&format!("; Max-Age={}", age));
+        }
+        cookie_str.push_str(&format!("; Path={}", path));
+        if http_only {
+            cookie_str.push_str("; HttpOnly");
+        }
+        self.headers.insert(
+            "Set-Cookie".to_string(),
+            cookie_str,
+        );
+        self
+    }
+    
+    /// Enable chunked transfer encoding
+    fn chunked(mut self, enable: bool) -> Self {
+        self.is_chunked = enable;
+        if enable {
+            self.headers.insert("Transfer-Encoding".to_string(), "chunked".to_string());
+            // Remove Content-Length for chunked encoding
+            self.headers.remove("Content-Length");
+        }
+        self
+    }
+    
+    /// Serve a static file
+    fn file(mut self, path: &str) -> Result<Self, std::io::Error> {
+        let file_data = std::fs::read(path)?;
+        let content_type = Self::get_content_type(path);
+        
+        self.body = file_data;
+        self.headers.insert("Content-Type".to_string(), content_type);
+        Ok(self)
+    }
+    
+    /// Get content type based on file extension
+    fn get_content_type(path: &str) -> String {
+        let content_type = if path.ends_with(".html") {
+            "text/html"
+        } else if path.ends_with(".css") {
+            "text/css"
+        } else if path.ends_with(".js") {
+            "application/javascript"
+        } else if path.ends_with(".json") {
+            "application/json"
+        } else if path.ends_with(".png") {
+            "image/png"
+        } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+            "image/jpeg"
+        } else if path.ends_with(".gif") {
+            "image/gif"
+        } else if path.ends_with(".svg") {
+            "image/svg+xml"
+        } else if path.ends_with(".pdf") {
+            "application/pdf"
+        } else if path.ends_with(".txt") {
+            "text/plain"
+        } else if path.ends_with(".xml") {
+            "application/xml"
+        } else if path.ends_with(".woff") {
+            "font/woff"
+        } else if path.ends_with(".woff2") {
+            "font/woff2"
+        } else {
+            "application/octet-stream"
+        };
+        content_type.to_string()
+    }
+    
+    /// Build the final HttpResponse
+    fn build(mut self) -> HttpResponse {
+        // Set Content-Length if not chunked and not already set
+        if !self.is_chunked && !self.headers.contains_key("Content-Length") {
+            self.headers.insert("Content-Length".to_string(), self.body.len().to_string());
+        }
+        
+        // Add Set-Cookie headers for cookies added via cookie()
+        for (name, value) in &self.cookies {
+            self.headers.insert(
+                "Set-Cookie".to_string(),
+                format!("{}={}", name, value),
+            );
+        }
+        
+        HttpResponse {
+            status: self.status,
+            status_text: self.status_text,
+            headers: self.headers,
+            body: self.body,
+            is_chunked: self.is_chunked,
+        }
     }
 }
 
@@ -93,6 +282,8 @@ impl HttpParser {
         let mut headers = HashMap::new();
         let mut cookies = HashMap::new();
         let mut body_start = 0;
+        let mut is_chunked = false;
+        let mut content_type = String::new();
         
         for (i, line) in lines.iter().enumerate().skip(1) {
             if line.is_empty() {
@@ -109,6 +300,16 @@ impl HttpParser {
                     Self::parse_cookies(&value, &mut cookies);
                 }
                 
+                // Check for chunked encoding
+                if key.to_lowercase() == "transfer-encoding" {
+                    is_chunked = value.to_lowercase().contains("chunked");
+                }
+                
+                // Store content type for multipart parsing
+                if key.to_lowercase() == "content-type" {
+                    content_type = value.clone();
+                }
+                
                 headers.insert(key, value);
             }
         }
@@ -121,11 +322,19 @@ impl HttpParser {
         };
         
         // Parse body
-        let body = if body_start < lines.len() {
+        let mut body = if body_start < lines.len() {
             lines[body_start..].join("\n").into_bytes()
         } else {
             Vec::new()
         };
+        
+        // Handle chunked encoding
+        if is_chunked {
+            body = Self::decode_chunked(&body);
+        }
+        
+        // Parse form data (multipart or urlencoded)
+        let (form_fields, form_files) = Self::parse_form_data(&content_type, &body);
         
         Some(HttpRequest {
             method,
@@ -135,6 +344,8 @@ impl HttpParser {
             headers,
             cookies,
             query_params,
+            form_fields,
+            form_files,
             body,
         })
     }
@@ -185,6 +396,137 @@ impl HttpParser {
         }
         
         result
+    }
+    
+    fn decode_chunked(data: &[u8]) -> Vec<u8> {
+        let mut result = Vec::new();
+        let data_str = String::from_utf8_lossy(data);
+        let lines: Vec<&str> = data_str.lines().collect();
+        
+        let mut i = 0;
+        while i < lines.len() {
+            let chunk_size_line = lines[i].trim();
+            
+            // Parse chunk size (hex number)
+            if let Ok(chunk_size) = usize::from_str_radix(chunk_size_line, 16) {
+                if chunk_size == 0 {
+                    // Last chunk
+                    break;
+                }
+                
+                i += 1;
+                if i < lines.len() {
+                    let chunk_data = lines[i].as_bytes();
+                    let data_to_add = std::cmp::min(chunk_size, chunk_data.len());
+                    result.extend_from_slice(&chunk_data[..data_to_add]);
+                }
+            }
+            
+            i += 1;
+        }
+        
+        result
+    }
+    
+    fn parse_form_data(content_type: &str, body: &[u8]) -> (HashMap<String, String>, HashMap<String, FormFile>) {
+        let mut fields = HashMap::new();
+        let mut files = HashMap::new();
+        
+        if content_type.contains("application/x-www-form-urlencoded") {
+            // Parse URL-encoded form data
+            let body_str = String::from_utf8_lossy(body);
+            for param in body_str.split('&') {
+                if let Some(pos) = param.find('=') {
+                    let key = Self::url_decode(&param[..pos]);
+                    let value = Self::url_decode(&param[pos + 1..]);
+                    fields.insert(key, value);
+                }
+            }
+        } else if content_type.contains("multipart/form-data") {
+            // Extract boundary from content type
+            if let Some(boundary_start) = content_type.find("boundary=") {
+                let boundary = &content_type[boundary_start + 9..];
+                let boundary = if let Some(semicolon) = boundary.find(';') {
+                    &boundary[..semicolon]
+                } else {
+                    boundary
+                };
+                
+                Self::parse_multipart(body, boundary, &mut fields, &mut files);
+            }
+        }
+        
+        (fields, files)
+    }
+    
+    fn parse_multipart(
+        body: &[u8],
+        boundary: &str,
+        fields: &mut HashMap<String, String>,
+        files: &mut HashMap<String, FormFile>,
+    ) {
+        let body_str = String::from_utf8_lossy(body);
+        let boundary_marker = format!("--{}", boundary);
+        let parts: Vec<&str> = body_str.split(&boundary_marker).collect();
+        
+        for part in parts.iter().skip(1) {
+            if part.contains("--") {
+                // End boundary
+                break;
+            }
+            
+            let part = part.trim();
+            if let Some(blank_line_pos) = part.find("\r\n\r\n") {
+                let headers_str = &part[..blank_line_pos];
+                let content = &part[blank_line_pos + 4..];
+                let content = content.trim_end_matches("\r\n");
+                
+                // Parse part headers
+                let mut field_name = String::new();
+                let mut filename = Option::<String>::None;
+                let mut content_type_part = String::from("text/plain");
+                
+                for header_line in headers_str.lines() {
+                    if let Some(colon_pos) = header_line.find(':') {
+                        let header_name = header_line[..colon_pos].trim().to_lowercase();
+                        let header_value = header_line[colon_pos + 1..].trim();
+                        
+                        if header_name == "content-disposition" {
+                            // Parse: form-data; name="field_name"; filename="file.txt"
+                            if let Some(name_start) = header_value.find("name=\"") {
+                                let name_start = name_start + 6;
+                                if let Some(name_end) = header_value[name_start..].find('"') {
+                                    field_name = header_value[name_start..name_start + name_end].to_string();
+                                }
+                            }
+                            
+                            if let Some(file_start) = header_value.find("filename=\"") {
+                                let file_start = file_start + 10;
+                                if let Some(file_end) = header_value[file_start..].find('"') {
+                                    filename = Some(header_value[file_start..file_start + file_end].to_string());
+                                }
+                            }
+                        } else if header_name == "content-type" {
+                            content_type_part = header_value.to_string();
+                        }
+                    }
+                }
+                
+                // Store field or file
+                if let Some(filename) = filename {
+                    files.insert(
+                        field_name,
+                        FormFile {
+                            filename,
+                            content_type: content_type_part,
+                            data: content.as_bytes().to_vec(),
+                        },
+                    );
+                } else {
+                    fields.insert(field_name, content.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -522,11 +864,105 @@ impl ErrorPages {
 
 // Route handlers
 fn handle_root(_req: &HttpRequest) -> HttpResponse {
-    HttpResponse::new(200, "OK", "<html><body><h1>Welcome to Localhost!</h1><p>Try visiting /api/users or /health</p></body></html>")
+    let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Localhost Server</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+        .container { max-width: 900px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+        h1 { color: #667eea; margin-top: 0; }
+        h2 { color: #764ba2; margin-top: 30px; }
+        .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-left: 4px solid #667eea; border-radius: 4px; }
+        .endpoint code { background: #e8e8ff; padding: 2px 6px; border-radius: 3px; font-weight: bold; }
+        .endpoint p { margin: 5px 0; color: #555; }
+        a { color: #667eea; text-decoration: none; font-weight: bold; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Welcome to Localhost Server</h1>
+        <p>A high-performance HTTP server built in Rust with epoll event loop and advanced HTTP parsing.</p>
+        
+        <h2>📍 Available Endpoints</h2>
+        
+        <div class="endpoint">
+            <code>GET /health</code>
+            <p>Check server health status in JSON format</p>
+            <p><a href="/health">Visit /health</a></p>
+        </div>
+        
+        <div class="endpoint">
+            <code>GET /api/users</code>
+            <p>Get user information with session management demonstration</p>
+            <p><a href="/api/users">Visit /api/users</a></p>
+        </div>
+        
+        <div class="endpoint">
+            <code>GET /inspect</code>
+            <p>Inspect HTTP request details (headers, cookies, query params, etc.)</p>
+            <p><a href="/inspect">Visit /inspect</a></p>
+        </div>
+        
+        <div class="endpoint">
+            <code>GET/POST /form-test</code>
+            <p>Test form parsing with URL-encoded and multipart/form-data support</p>
+            <p><a href="/form-test">Visit /form-test</a></p>
+        </div>
+        
+        <div class="endpoint">
+            <code>GET /download</code>
+            <p>Chunked transfer encoding demonstration for streaming responses</p>
+            <p><a href="/download">Visit /download</a></p>
+        </div>
+        
+        <div class="endpoint">
+            <code>GET /login</code>
+            <p>Session management demonstration with cookie options</p>
+            <p><a href="/login">Visit /login</a></p>
+        </div>
+        
+        <div class="endpoint">
+            <code>GET /static</code>
+            <p>Static file serving with automatic MIME type detection</p>
+            <p><a href="/static">Visit /static</a></p>
+        </div>
+        
+        <div class="endpoint">
+            <code>GET /api/*</code>
+            <p>Catch-all API endpoint for other paths</p>
+            <p><a href="/api/posts">Example: /api/posts</a></p>
+        </div>
+        
+        <h2>✨ Features</h2>
+        <ul>
+            <li>⚡ High-performance epoll-based event loop (Linux)</li>
+            <li>🔍 Advanced HTTP parser with chunked encoding support</li>
+            <li>📝 Form data parsing (URL-encoded and multipart)</li>
+            <li>🍪 Cookie extraction and session management</li>
+            <li>📊 Query parameter parsing with URL decoding</li>
+            <li>📁 Static file serving with MIME type detection</li>
+            <li>🔗 Fluent API response builder</li>
+        </ul>
+    </div>
+</body>
+</html>"#;
+    
+    ResponseBuilder::new()
+        .status(200, "OK")
+        .content_type("text/html; charset=utf-8")
+        .body_text(html)
+        .build()
 }
 
 fn handle_health(_req: &HttpRequest) -> HttpResponse {
-    HttpResponse::new(200, "OK", r#"{"status": "healthy"}"#)
+    ResponseBuilder::new()
+        .status(200, "OK")
+        .content_type("application/json")
+        .body_text(r#"{"status": "healthy", "timestamp": "2025-12-09T20:00:00Z"}"#)
+        .header("Cache-Control", "no-cache")
+        .build()
 }
 
 fn handle_users(req: &HttpRequest) -> HttpResponse {
@@ -534,15 +970,25 @@ fn handle_users(req: &HttpRequest) -> HttpResponse {
         r#"{{"path": "{}", "method": "{}"}}"#,
         req.path, req.method
     );
-    HttpResponse::new(200, "OK", &body)
+    ResponseBuilder::new()
+        .status(200, "OK")
+        .content_type("application/json")
+        .body_text(&body)
+        .cookie_with_options("user_session", "session_12345", Some(3600), "/api", true)
+        .build()
 }
 
 fn handle_api_catch_all(req: &HttpRequest) -> HttpResponse {
     let body = format!(
-        r#"{{"message": "API endpoint", "path": "{}", "method": "{}"}}"#,
+        r#"{{"message": "API endpoint", "path": "{}", "method": "{}", "timestamp": "2025-12-09T20:00:00Z"}}"#,
         req.path, req.method
     );
-    HttpResponse::new(200, "OK", &body)
+    ResponseBuilder::new()
+        .status(200, "OK")
+        .content_type("application/json")
+        .body_text(&body)
+        .header("X-API-Version", "1.0")
+        .build()
 }
 
 fn handle_inspect(req: &HttpRequest) -> HttpResponse {
@@ -641,7 +1087,298 @@ fn handle_inspect(req: &HttpRequest) -> HttpResponse {
     </body>
 </html>"#);
     
-    HttpResponse::new(200, "OK", &body)
+    ResponseBuilder::new()
+        .status(200, "OK")
+        .content_type("text/html; charset=utf-8")
+        .body_text(&body)
+        .header("X-Inspector", "true")
+        .build()
+}
+
+fn handle_form_test(req: &HttpRequest) -> HttpResponse {
+    let mut body = String::from(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Form Parser Test</title>
+    <style>
+        body { font-family: monospace; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+        h1 { color: #667eea; }
+        .section { margin: 20px 0; padding: 15px; background: #f9f9f9; border-left: 4px solid #667eea; }
+        h2 { color: #333; margin: 0 0 10px 0; }
+        table { width: 100%; border-collapse: collapse; }
+        td { padding: 8px; border-bottom: 1px solid #ddd; }
+        td:first-child { font-weight: bold; width: 25%; color: #667eea; }
+        code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
+        .form-section { background: white; padding: 20px; margin: 20px 0; border: 1px solid #ddd; border-radius: 8px; }
+        input, textarea { width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ddd; border-radius: 4px; font-family: monospace; }
+        button { background: #667eea; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin-top: 10px; }
+        button:hover { background: #764ba2; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HTTP Parser Features Demo</h1>"#);
+    
+    body.push_str(r#"
+        <div class="section">
+            <h2>✅ Implemented Features</h2>
+            <ul>
+                <li><strong>Parse Request Line:</strong> Method, Path, Query String, HTTP Version</li>
+                <li><strong>Extract Cookies:</strong> Automatic parsing from Cookie header</li>
+                <li><strong>Query Parameters:</strong> URL decoding support</li>
+                <li><strong>Chunked Encoding:</strong> Automatic decoding of chunked transfer encoding</li>
+                <li><strong>Form Data:</strong> URL-encoded and multipart/form-data parsing</li>
+                <li><strong>Headers:</strong> All HTTP headers parsed and accessible</li>
+            </ul>
+        </div>"#);
+    
+    // Show current request details
+    body.push_str(r#"
+        <div class="section">
+            <h2>Current Request Info</h2>
+            <table>
+                <tr><td>Method:</td><td>"#);
+    body.push_str(&req.method);
+    body.push_str(r#"</td></tr>
+                <tr><td>Path:</td><td>"#);
+    body.push_str(&req.path);
+    body.push_str(r#"</td></tr>
+                <tr><td>HTTP Version:</td><td>"#);
+    body.push_str(&req.version);
+    body.push_str(r#"</td></tr>
+            </table>
+        </div>"#);
+    
+    // Form fields
+    if !req.form_fields.is_empty() {
+        body.push_str(r#"
+        <div class="section">
+            <h2>Form Fields Parsed</h2>
+            <table>"#);
+        for (name, value) in &req.form_fields {
+            body.push_str(&format!(
+                r#"<tr><td>{}:</td><td><code>{}</code></td></tr>"#,
+                name, value
+            ));
+        }
+        body.push_str("</table></div>");
+    }
+    
+    // Form files
+    if !req.form_files.is_empty() {
+        body.push_str(r#"
+        <div class="section">
+            <h2>Files Uploaded</h2>
+            <table>"#);
+        for (field_name, file) in &req.form_files {
+            body.push_str(&format!(
+                r#"<tr><td>{}:</td><td><code>{}</code> ({} bytes, type: {})</td></tr>"#,
+                field_name, file.filename, file.data.len(), file.content_type
+            ));
+        }
+        body.push_str("</table></div>");
+    }
+    
+    // Test forms
+    body.push_str(r#"
+        <div class="form-section">
+            <h2>📝 Test URL-Encoded Form</h2>
+            <form method="POST" action="/form-test" enctype="application/x-www-form-urlencoded">
+                <label>Username:</label><input type="text" name="username" value="john_doe">
+                <label>Email:</label><input type="email" name="email" value="john@example.com">
+                <label>Message:</label><textarea name="message">Hello from form!</textarea>
+                <button type="submit">Submit Form (URL-Encoded)</button>
+            </form>
+        </div>
+        
+        <div class="form-section">
+            <h2>📤 Test Multipart Form</h2>
+            <form method="POST" action="/form-test" enctype="multipart/form-data">
+                <label>Name:</label><input type="text" name="name" value="John Doe">
+                <label>File:</label><input type="file" name="upload">
+                <label>Description:</label><textarea name="description">File upload test</textarea>
+                <button type="submit">Submit Form (Multipart)</button>
+            </form>
+        </div>
+        
+        <div class="section">
+            <h2>cURL Examples</h2>
+            <p><strong>URL-Encoded POST:</strong><br>
+            <code>curl -X POST -d "username=john&email=john@example.com&message=hello" http://localhost:8080/form-test</code></p>
+            <p><strong>With Chunked Encoding:</strong><br>
+            <code>curl -X POST -H "Transfer-Encoding: chunked" -d "data=value" http://localhost:8080/form-test</code></p>
+        </div>
+    </div>
+</body>
+</html>"#);
+    
+    ResponseBuilder::new()
+        .status(200, "OK")
+        .content_type("text/html; charset=utf-8")
+        .body_text(&body)
+        .header("X-Form-Parser", "enabled")
+        .build()
+}
+
+fn handle_download(_req: &HttpRequest) -> HttpResponse {
+    // Demonstrate chunked transfer encoding for streaming responses
+    let large_content = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Chunked Response Demo</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+        h1 { color: #667eea; }
+        p { line-height: 1.6; color: #333; }
+        .highlight { background: #fff3cd; padding: 10px; border-left: 4px solid #ffc107; margin: 10px 0; }
+        code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📥 Chunked Transfer Encoding Demo</h1>
+        <p>This response was sent using <strong>Transfer-Encoding: chunked</strong>, allowing the server to stream large content without knowing the total size in advance.</p>
+        
+        <div class="highlight">
+            <strong>✨ Benefits of Chunked Encoding:</strong>
+            <ul>
+                <li>Stream responses without pre-calculating Content-Length</li>
+                <li>Ideal for dynamic or generated content</li>
+                <li>Enable HTTP/1.1 trailers</li>
+                <li>Support for gzip-like compression</li>
+                <li>Better for real-time data (SSE, WebSocket upgrades)</li>
+            </ul>
+        </div>
+        
+        <h2>How It Works</h2>
+        <p>With chunked encoding enabled, the response body is sent as a series of chunks:</p>
+        <code>[chunk size in hex]\r\n[chunk data]\r\n[next chunk size]\r\n[chunk data]\r\n0\r\n</code>
+        
+        <p>The ResponseBuilder automatically handles this when you call <code>.chunked(true)</code>:</p>
+        <code>ResponseBuilder::new().body_text("...").chunked(true).build()</code>
+        
+        <h2>Use Cases</h2>
+        <ul>
+            <li><strong>Server-Sent Events (SSE):</strong> Send real-time updates to clients</li>
+            <li><strong>Large File Downloads:</strong> Stream without buffering entire file</li>
+            <li><strong>API Responses:</strong> Generate large JSON responses on-the-fly</li>
+            <li><strong>Web Sockets Upgrade:</strong> Handshake mechanism uses chunked encoding</li>
+            <li><strong>Streaming Analytics:</strong> Send metrics as they're collected</li>
+        </ul>
+        
+        <p><strong>View the HTTP headers:</strong> Open Developer Tools (F12) → Network tab and check the response headers for <code>Transfer-Encoding: chunked</code></p>
+    </div>
+</body>
+</html>"#;
+    
+    ResponseBuilder::new()
+        .status(200, "OK")
+        .content_type("text/html; charset=utf-8")
+        .body_text(large_content)
+        .chunked(true)
+        .header("Cache-Control", "no-store")
+        .build()
+}
+
+fn handle_login(_req: &HttpRequest) -> HttpResponse {
+    // Demonstrate advanced cookie management for sessions
+    let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Session Management Demo</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+        h1 { color: #667eea; margin-top: 0; }
+        .session-box { background: #f0f7ff; padding: 15px; border: 2px solid #667eea; border-radius: 8px; margin: 20px 0; }
+        .cookie-item { background: white; padding: 10px; margin: 10px 0; border-left: 4px solid #764ba2; }
+        code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-weight: bold; }
+        ul { line-height: 1.8; }
+        .note { background: #fff3cd; padding: 10px; border-radius: 4px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Session Management Demo</h1>
+        
+        <div class="session-box">
+            <h2>Cookies Set by This Response:</h2>
+            <div class="cookie-item">
+                <strong>user_session:</strong> <code>session_12345</code><br>
+                <small>HttpOnly, Max-Age: 3600 seconds (1 hour), Path: /</small>
+            </div>
+            <div class="cookie-item">
+                <strong>preferences:</strong> <code>theme=dark&lang=en</code><br>
+                <small>HttpOnly, Max-Age: 2592000 seconds (30 days), Path: /</small>
+            </div>
+        </div>
+        
+        <h2>💡 How SessionManagement Works</h2>
+        <ul>
+            <li><strong>HttpOnly Flag:</strong> Prevents JavaScript access, protects against XSS attacks</li>
+            <li><strong>Max-Age:</strong> Session lifetime in seconds (3600 = 1 hour)</li>
+            <li><strong>Path:</strong> Cookie scope (/ = entire domain)</li>
+            <li><strong>Secure Flag:</strong> Should be set in production (HTTPS only)</li>
+            <li><strong>SameSite:</strong> CSRF protection (not shown, but recommended)</li>
+        </ul>
+        
+        <div class="note">
+            <strong>✅ Recommended Practices:</strong>
+            <ul>
+                <li>Store sensitive data server-side, use session ID in cookie</li>
+                <li>Always use HttpOnly flag for session cookies</li>
+                <li>Use Secure flag in production (HTTPS only)</li>
+                <li>Implement server-side session validation</li>
+                <li>Set reasonable Max-Age values</li>
+                <li>Implement logout to clear session cookies</li>
+            </ul>
+        </div>
+        
+        <h2>Implementation Example</h2>
+        <p>Using <code>ResponseBuilder::cookie_with_options()</code>:</p>
+        <code style="display: block; background: #f5f5f5; padding: 10px; border-radius: 4px; margin: 10px 0; overflow-x: auto;">
+ResponseBuilder::new()<br>
+&nbsp;&nbsp;.status(200, "OK")<br>
+&nbsp;&nbsp;.cookie_with_options("user_session", "session_12345", Some(3600), "/", true)<br>
+&nbsp;&nbsp;.body_text("...")<br>
+&nbsp;&nbsp;.build()
+        </code>
+        
+        <p>Next step: <a href="/protected" style="color: #667eea; font-weight: bold;">Visit /protected</a> to see session validation</p>
+    </div>
+</body>
+</html>"#;
+    
+    ResponseBuilder::new()
+        .status(200, "OK")
+        .content_type("text/html; charset=utf-8")
+        .body_text(html)
+        .cookie_with_options("user_session", "session_12345", Some(3600), "/", true)
+        .cookie_with_options("preferences", "theme=dark&lang=en", Some(2592000), "/", true)
+        .header("X-Session-Demo", "true")
+        .build()
+}
+
+fn handle_static(_req: &HttpRequest) -> HttpResponse {
+    // Demonstrate static file serving with ResponseBuilder
+    match ResponseBuilder::new().file("static/example.html") {
+        Ok(builder) => {
+            builder
+                .status(200, "OK")
+                .header("Cache-Control", "public, max-age=3600")
+                .build()
+        }
+        Err(_) => {
+            // If file not found, return 404 error page
+            ResponseBuilder::new()
+                .status(404, "Not Found")
+                .content_type("text/html; charset=utf-8")
+                .body_text(&ErrorPages::not_found())
+                .build()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -745,8 +1482,13 @@ impl Server {
         router.register("GET", "/", handle_root);
         router.register("GET", "/health", handle_health);
         router.register("GET", "/inspect", handle_inspect);
+        router.register("GET", "/form-test", handle_form_test);
+        router.register("POST", "/form-test", handle_form_test);
         router.register("GET", "/api/users", handle_users);
         router.register("POST", "/api/users", handle_users);
+        router.register("GET", "/download", handle_download);
+        router.register("GET", "/login", handle_login);
+        router.register("GET", "/static", handle_static);
         router.register("GET", "/api/", handle_api_catch_all);
         router.register("POST", "/api/", handle_api_catch_all);
         
