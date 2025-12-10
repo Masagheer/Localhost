@@ -6,6 +6,8 @@ use libc::{epoll_create1, epoll_ctl, epoll_wait, epoll_event, EPOLLIN, EPOLLERR,
 // Import Serde
 use serde_derive::Deserialize;
 use std::fs;
+use std::process::{Command, Stdio};
+use std::env;
 
 // Form data structures
 #[derive(Debug, Clone)]
@@ -85,6 +87,175 @@ impl HttpResponse {
         }
         
         bytes
+    }
+}
+
+/// CGI Executor - Handles Common Gateway Interface script execution
+struct CGIExecutor;
+
+impl CGIExecutor {
+    /// Execute a CGI script and return the HTTP response
+    fn execute(
+        script_path: &str,
+        request: &HttpRequest,
+        client_ip: &str,
+    ) -> io::Result<HttpResponse> {
+        // Verify script exists
+        if !std::path::Path::new(script_path).exists() {
+            return Ok(HttpResponse::new(404, "Not Found", "CGI script not found"));
+        }
+
+        // Make script executable
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(script_path)
+            .output()
+            .ok();
+
+        // Build environment variables for CGI
+        let env_vars = Self::build_cgi_env(request, client_ip);
+
+        // Determine request method for stdin handling
+        let use_stdin = request.method == "POST" || request.method == "PUT";
+        let stdin_data: &[u8] = if use_stdin { &request.body } else { &[] };
+
+        // Execute the script
+        let mut child = Command::new(script_path)
+            .env_clear()
+            .envs(&env_vars)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        // Write request body to stdin if needed
+        if use_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(stdin_data);
+            }
+        }
+
+        // Wait for output with a simple approach: read all output synchronously
+        // The subprocess should complete quickly for CGI scripts
+        let output = child.wait_with_output()?;
+
+        if !output.stderr.is_empty() {
+            eprintln!("CGI stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
+
+        // Parse CGI response from bytes
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        Self::parse_cgi_response(&output_str)
+    }
+
+    /// Build CGI environment variables based on HTTP request
+    fn build_cgi_env(request: &HttpRequest, client_ip: &str) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+
+        // CGI Standard Variables
+        env.insert("REQUEST_METHOD".to_string(), request.method.clone());
+        env.insert("SCRIPT_NAME".to_string(), request.path.clone());
+        env.insert("PATH_INFO".to_string(), request.path.clone());
+        env.insert("QUERY_STRING".to_string(), 
+                   request.query_string.clone().unwrap_or_default());
+        env.insert("CONTENT_LENGTH".to_string(), 
+                   request.body.len().to_string());
+        
+        // HTTP Headers as environment variables
+        if let Some(content_type) = request.headers.get("Content-Type") {
+            env.insert("CONTENT_TYPE".to_string(), content_type.clone());
+        } else {
+            env.insert("CONTENT_TYPE".to_string(), "text/plain".to_string());
+        }
+
+        // Server information
+        env.insert("SERVER_NAME".to_string(), "localhost".to_string());
+        env.insert("SERVER_PORT".to_string(), "8000".to_string());
+        env.insert("SERVER_PROTOCOL".to_string(), request.version.clone());
+        env.insert("SERVER_SOFTWARE".to_string(), "localhost-http-server/1.0".to_string());
+
+        // Client information
+        env.insert("REMOTE_ADDR".to_string(), client_ip.to_string());
+        env.insert("REMOTE_HOST".to_string(), client_ip.to_string());
+
+        // HTTP Request Headers (converted to CGI format)
+        for (key, value) in &request.headers {
+            let cgi_key = format!("HTTP_{}", 
+                key.to_uppercase().replace("-", "_"));
+            env.insert(cgi_key, value.clone());
+        }
+
+        // Additional CGI variables
+        env.insert("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string());
+
+        // Inherit system environment for PATH and other system variables
+        for (key, value) in env::vars() {
+            if key == "PATH" || key == "HOME" || key == "USER" {
+                env.insert(key, value);
+            }
+        }
+
+        env
+    }
+
+    /// Parse CGI response (headers + body)
+    fn parse_cgi_response(output: &str) -> io::Result<HttpResponse> {
+        // Split headers and body by double newline
+        let parts: Vec<&str> = output.splitn(2, "\r\n\r\n").collect();
+        
+        let (headers_str, body_str) = if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            // Try with just \n\n
+            let parts: Vec<&str> = output.splitn(2, "\n\n").collect();
+            if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                // No headers, entire output is body
+                ("Status: 200 OK", output)
+            }
+        };
+
+        let mut status_code = 200u16;
+        let mut status_text = "OK".to_string();
+        let mut response_headers = HashMap::new();
+
+        // Parse CGI headers
+        for line in headers_str.lines() {
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with("Status:") {
+                let status_line = line.trim_start_matches("Status:").trim();
+                let parts: Vec<&str> = status_line.splitn(2, ' ').collect();
+                if parts.len() >= 1 {
+                    if let Ok(code) = parts[0].parse::<u16>() {
+                        status_code = code;
+                        if parts.len() > 1 {
+                            status_text = parts[1].to_string();
+                        }
+                    }
+                }
+            } else if let Some(colon_pos) = line.find(':') {
+                let key = line[..colon_pos].trim();
+                let value = line[colon_pos + 1..].trim();
+                response_headers.insert(key.to_string(), value.to_string());
+            }
+        }
+
+        // If no Content-Type was set, default to text/html
+        if !response_headers.contains_key("Content-Type") {
+            response_headers.insert("Content-Type".to_string(), "text/html".to_string());
+        }
+
+        Ok(HttpResponse {
+            status: status_code,
+            status_text,
+            headers: response_headers,
+            body: body_str.as_bytes().to_vec(),
+            is_chunked: false,
+        })
     }
 }
 
@@ -558,6 +729,11 @@ impl Router {
     }
     
     fn handle(&self, request: &HttpRequest) -> HttpResponse {
+        // Check for CGI paths first (/cgi-bin/*)
+        if request.path.starts_with("/cgi-bin/") {
+            return handle_cgi(request, "127.0.0.1");
+        }
+
         // Try to find an exact match first
         for route in &self.routes {
             if route.method == request.method && route.path == request.path {
@@ -1376,6 +1552,43 @@ fn handle_static(_req: &HttpRequest) -> HttpResponse {
                 .status(404, "Not Found")
                 .content_type("text/html; charset=utf-8")
                 .body_text(&ErrorPages::not_found())
+                .build()
+        }
+    }
+}
+
+fn handle_cgi(req: &HttpRequest, client_ip: &str) -> HttpResponse {
+    // Extract script name from path (e.g., /cgi-bin/script.cgi)
+    let cgi_path = format!("cgi-bin/{}", req.path.trim_start_matches("/cgi-bin/"));
+    
+    match CGIExecutor::execute(&cgi_path, req, client_ip) {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("CGI execution error: {}", e);
+            ResponseBuilder::new()
+                .status(500, "Internal Server Error")
+                .content_type("text/html; charset=utf-8")
+                .body_text(&format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>CGI Error</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+        .error {{ background: #ffebee; padding: 20px; border-left: 4px solid #f44336; border-radius: 4px; }}
+        code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }}
+    </style>
+</head>
+<body>
+    <div class="error">
+        <h1>CGI Execution Error</h1>
+        <p><strong>Error:</strong> <code>{}</code></p>
+        <p>Failed to execute CGI script at <code>{}</code></p>
+    </div>
+</body>
+</html>"#,
+                    e, cgi_path
+                ))
                 .build()
         }
     }
